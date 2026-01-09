@@ -1,7 +1,19 @@
 #!/bin/bash
 #
-# Rock 5B+ Router Setup Script
+# Rock 5B+ Router Setup Script - Version 2
 # Configures Armbian as a secure router with WireGuard VPN, WiFi AP, and Twingate
+#
+# CHANGES FROM V1:
+# - Swapped WAN/LAN interfaces (USB for WAN, onboard for LAN - more stable)
+# - Separated subnets: WiFi 10.3.141.0/24, Wired 10.3.142.0/24
+# - Fixed WireGuard config (removed DNS, removed IPv6 from AllowedIPs)
+# - Added netplan permissions (chmod 600)
+# - Disabled systemd-resolved to prevent dnsmasq conflicts
+# - Added WireGuard watchdog service for route monitoring
+# - Disabled USB autosuspend for ethernet stability
+# - Consolidated firewall into dedicated service
+# - Hardcoded Twingate tokens in docker-compose.yml
+# - Improved service ordering and dependencies
 #
 
 set -e
@@ -13,7 +25,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Rock 5B+ Router Setup Script${NC}"
+echo -e "${GREEN}  Rock 5B+ Router Setup Script v2${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 
@@ -26,13 +38,27 @@ fi
 # Configuration variables - EDIT THESE
 WIFI_SSID="CloudBranch"
 WIFI_PASSWORD="YourSecurePassword123"  # CHANGE THIS!
-WAN_INTERFACE="enP4p65s0"
-LAN_INTERFACE="enx9c69d33ab2f0"
-WIFI_INTERFACE="wlP2p33s0"
-LAN_IP="10.3.141.1"
-LAN_SUBNET="10.3.141.0/24"
-DHCP_START="10.3.141.50"
-DHCP_END="10.3.141.200"
+
+# INTERFACE ASSIGNMENT (v2 - SWAPPED for stability)
+# USB ethernet is more tolerant of issues, so use for WAN (DHCP from ISP)
+# Onboard ethernet is more reliable, so use for LAN (local network)
+WAN_INTERFACE="enx9c69d33ab2f0"        # USB Ethernet -> Hitron modem
+LAN_INTERFACE="enP4p65s0"              # Onboard Ethernet -> TP-Link switch
+WIFI_INTERFACE="wlP2p33s0"             # Built-in WiFi
+
+# SUBNET SEPARATION (v2 - prevents routing conflicts)
+# WiFi devices get 10.3.141.x
+# Wired devices get 10.3.142.x
+WIFI_IP="10.3.141.1"
+WIFI_SUBNET="10.3.141.0/24"
+WIFI_DHCP_START="10.3.141.50"
+WIFI_DHCP_END="10.3.141.200"
+
+LAN_IP="10.3.142.1"
+LAN_SUBNET="10.3.142.0/24"
+LAN_DHCP_START="10.3.142.50"
+LAN_DHCP_END="10.3.142.200"
+
 VPN_ENDPOINT="95.173.217.65"
 VPN_PORT="51820"
 
@@ -43,10 +69,11 @@ TWINGATE_REFRESH_TOKEN="YcE1UsCkpfyhHtdHxcYTUKSb5fQue_mxoBYICPzvNgOsFiUxPwCFrKdk
 
 echo -e "${YELLOW}Configuration:${NC}"
 echo "  WiFi SSID: $WIFI_SSID"
-echo "  WAN Interface: $WAN_INTERFACE"
-echo "  LAN Interface: $LAN_INTERFACE"
+echo "  WAN Interface: $WAN_INTERFACE (USB Ethernet)"
+echo "  LAN Interface: $LAN_INTERFACE (Onboard Ethernet)"
 echo "  WiFi Interface: $WIFI_INTERFACE"
-echo "  LAN IP: $LAN_IP"
+echo "  WiFi Network: $WIFI_IP ($WIFI_SUBNET)"
+echo "  Wired Network: $LAN_IP ($LAN_SUBNET)"
 echo ""
 echo -e "${YELLOW}Press Enter to continue or Ctrl+C to cancel...${NC}"
 read
@@ -128,6 +155,29 @@ EOF
 
 sysctl --system
 
+# Disable USB autosuspend for ethernet adapters (prevents disconnections)
+echo -e "${YELLOW}[Phase 3] Disabling USB autosuspend for ethernet adapters...${NC}"
+cat > /etc/udev/rules.d/50-usb-ethernet-power.rules << 'EOF'
+# Disable autosuspend for USB ethernet adapters
+ACTION=="add", SUBSYSTEM=="usb", DRIVER=="r8152", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", DRIVER=="cdc_ether", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", DRIVER=="cdc_ncm", ATTR{power/control}="on"
+EOF
+
+udevadm control --reload-rules
+udevadm trigger
+
+# Disable systemd-resolved (conflicts with dnsmasq)
+echo -e "${YELLOW}[Phase 3] Disabling systemd-resolved...${NC}"
+systemctl stop systemd-resolved 2>/dev/null || true
+systemctl disable systemd-resolved 2>/dev/null || true
+# Restore /etc/resolv.conf
+rm -f /etc/resolv.conf
+cat > /etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+EOF
+
 echo -e "${GREEN}[Phase 3] System configured${NC}"
 
 # ============================================
@@ -145,19 +195,35 @@ echo -e "${GREEN}[Phase 4] Directories created${NC}"
 # ============================================
 echo -e "${GREEN}[Phase 5] Configuring network interfaces...${NC}"
 
-# Configure LAN interface
+# Configure network interfaces with separate subnets
 cat > /etc/netplan/01-router-config.yaml << EOF
 network:
   version: 2
   renderer: networkd
   ethernets:
+    # WAN interface - USB Ethernet to Hitron modem (DHCP)
     ${WAN_INTERFACE}:
       dhcp4: true
+      dhcp4-overrides:
+        use-dns: false
+
+    # LAN interface - Onboard Ethernet to TP-Link switch
     ${LAN_INTERFACE}:
       addresses:
         - ${LAN_IP}/24
       dhcp4: false
+
+  # WiFi Access Point interface
+  wifis:
+    ${WIFI_INTERFACE}:
+      addresses:
+        - ${WIFI_IP}/24
+      dhcp4: false
+      access-points: {}
 EOF
+
+# Set secure permissions on netplan config
+chmod 600 /etc/netplan/01-router-config.yaml
 
 netplan apply
 sleep 2
@@ -169,28 +235,21 @@ echo -e "${GREEN}[Phase 5] Network configured${NC}"
 # ============================================
 echo -e "${GREEN}[Phase 6] Configuring WireGuard VPN...${NC}"
 
+# Create WireGuard config without DNS line (causes resolvconf failures)
+# and without IPv6 in AllowedIPs (IPv6 is disabled)
 cat > /opt/router/config/wireguard/wg0.conf << EOF
 [Interface]
 # ProtonVPN Configuration
 PrivateKey = OGoNbUSA5buvqsQeGvuqmoAhX82j6aduv531Hg8+6VY=
 Address = 10.2.0.2/32
-DNS = 10.2.0.1
 
-PostUp = iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
-PostUp = iptables -A FORWARD -i %i -o ${LAN_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT
-PostUp = iptables -A FORWARD -i ${LAN_INTERFACE} -o %i -j ACCEPT
-PostUp = iptables -A FORWARD -i %i -o ${WIFI_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT
-PostUp = iptables -A FORWARD -i ${WIFI_INTERFACE} -o %i -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -o ${LAN_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT
-PostDown = iptables -D FORWARD -i ${LAN_INTERFACE} -o %i -j ACCEPT
-PostDown = iptables -D FORWARD -i %i -o ${WIFI_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT
-PostDown = iptables -D FORWARD -i ${WIFI_INTERFACE} -o %i -j ACCEPT
+# Note: PostUp/PostDown removed - firewall managed by dedicated service
 
 [Peer]
 # US-FREE#103
 PublicKey = t00VQfd/5e18CVfZh7DuFSuwYl+TJ75I7NbQf+BcNQc=
-AllowedIPs = 0.0.0.0/0, ::/0
+# Only IPv4 - IPv6 disabled on this system
+AllowedIPs = 0.0.0.0/0
 Endpoint = ${VPN_ENDPOINT}:${VPN_PORT}
 PersistentKeepalive = 25
 EOF
@@ -198,7 +257,51 @@ EOF
 chmod 600 /opt/router/config/wireguard/wg0.conf
 ln -sf /opt/router/config/wireguard/wg0.conf /etc/wireguard/wg0.conf
 
+# Create WireGuard watchdog service to monitor and restore routes
+cat > /etc/systemd/system/wireguard-watchdog.service << 'EOF'
+[Unit]
+Description=WireGuard Route Watchdog
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/opt/router/config/wireguard/watchdog.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /opt/router/config/wireguard/watchdog.sh << 'EOF'
+#!/bin/bash
+# WireGuard routing watchdog - monitors and restores routes if lost
+
+while true; do
+    sleep 60
+
+    # Check if wg0 interface exists and has routes
+    if ip link show wg0 &>/dev/null; then
+        # Check if VPN route exists
+        if ! ip route show | grep -q "default dev wg0"; then
+            echo "$(date): WireGuard route lost, attempting to restore..."
+            systemctl restart wg-quick@wg0
+            sleep 5
+            # Reapply firewall rules
+            /opt/router/config/iptables/firewall.sh
+        fi
+    else
+        echo "$(date): WireGuard interface down, restarting..."
+        systemctl restart wg-quick@wg0
+    fi
+done
+EOF
+
+chmod +x /opt/router/config/wireguard/watchdog.sh
+
 systemctl enable wg-quick@wg0
+systemctl enable wireguard-watchdog
 systemctl start wg-quick@wg0 || echo -e "${YELLOW}WireGuard may need manual start after reboot${NC}"
 
 echo -e "${GREEN}[Phase 6] WireGuard configured${NC}"
@@ -233,9 +336,7 @@ EOF
 
 echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' > /etc/default/hostapd
 
-# Set WiFi interface IP manually (hostapd handles the wireless part)
-ip addr add ${LAN_IP}/24 dev ${WIFI_INTERFACE} 2>/dev/null || true
-ip link set ${WIFI_INTERFACE} up
+# WiFi IP is now configured via netplan (no manual ip addr add needed)
 
 systemctl unmask hostapd
 systemctl enable hostapd
@@ -250,27 +351,48 @@ echo -e "${GREEN}[Phase 8] Configuring DHCP server...${NC}"
 
 mv /etc/dnsmasq.conf /etc/dnsmasq.conf.backup 2>/dev/null || true
 
+# Configure dnsmasq for dual subnets (WiFi and Wired separated)
 cat > /etc/dnsmasq.conf << EOF
+# Interface binding - listen on LAN interfaces only
 interface=${LAN_INTERFACE}
 interface=${WIFI_INTERFACE}
 bind-interfaces
 
-server=10.2.0.1
+# Upstream DNS servers
 server=1.1.1.1
 server=1.0.0.1
 
-dhcp-range=${DHCP_START},${DHCP_END},24h
-dhcp-option=option:router,${LAN_IP}
-dhcp-option=option:dns-server,${LAN_IP}
+# DHCP range for Wired LAN (10.3.142.x)
+dhcp-range=set:wired,${LAN_DHCP_START},${LAN_DHCP_END},24h
 
+# DHCP range for WiFi (10.3.141.x)
+dhcp-range=set:wifi,${WIFI_DHCP_START},${WIFI_DHCP_END},24h
+
+# Gateway options (per subnet)
+dhcp-option=tag:wired,option:router,${LAN_IP}
+dhcp-option=tag:wifi,option:router,${WIFI_IP}
+
+# DNS server (router IP for both networks)
+dhcp-option=tag:wired,option:dns-server,${LAN_IP}
+dhcp-option=tag:wifi,option:dns-server,${WIFI_IP}
+
+# Static reservations
+# TP-Link Switch on wired network
+dhcp-host=set:wired,*:*:*:*:*:*,tp-link-switch,10.3.142.250
+
+# Domain
 domain=local
 local=/local/
 
+# Logging
 log-queries
 log-dhcp
 log-facility=/var/log/dnsmasq.log
 
+# Cache settings
 cache-size=1000
+
+# Security
 bogus-priv
 domain-needed
 stop-dns-rebind
@@ -289,6 +411,8 @@ echo -e "${GREEN}[Phase 9] Configuring firewall...${NC}"
 
 cat > /opt/router/config/iptables/firewall.sh << EOF
 #!/bin/bash
+# Firewall configuration for Rock 5B+ Router
+# v2 - Updated for swapped interfaces and dual subnets
 
 # Flush existing rules
 iptables -F
@@ -326,29 +450,31 @@ iptables -A INPUT -i ${WIFI_INTERFACE} -p tcp --dport 53 -j ACCEPT
 iptables -A INPUT -i ${LAN_INTERFACE} -p icmp -j ACCEPT
 iptables -A INPUT -i ${WIFI_INTERFACE} -p icmp -j ACCEPT
 
-# Allow WireGuard
-iptables -A INPUT -p udp --dport 51820 -j ACCEPT
+# Allow WireGuard VPN port from WAN
+iptables -A INPUT -i ${WAN_INTERFACE} -p udp --dport ${VPN_PORT} -j ACCEPT
 
-# Forward LAN traffic to VPN
+# Forward LAN traffic to VPN (both WiFi and Wired)
 iptables -A FORWARD -i ${LAN_INTERFACE} -o wg0 -j ACCEPT
 iptables -A FORWARD -i ${WIFI_INTERFACE} -o wg0 -j ACCEPT
 iptables -A FORWARD -i wg0 -o ${LAN_INTERFACE} -j ACCEPT
 iptables -A FORWARD -i wg0 -o ${WIFI_INTERFACE} -j ACCEPT
 
-# Allow LAN to LAN (WiFi <-> Wired)
+# Allow LAN to LAN (WiFi <-> Wired communication)
 iptables -A FORWARD -i ${LAN_INTERFACE} -o ${WIFI_INTERFACE} -j ACCEPT
 iptables -A FORWARD -i ${WIFI_INTERFACE} -o ${LAN_INTERFACE} -j ACCEPT
 
 # NAT for VPN tunnel
 iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
 
-# KILL SWITCH: Block WAN access if VPN is down
+# VPN KILL SWITCH: Block WAN access if VPN is down
+# Only allow VPN endpoint connection on WAN
 iptables -A OUTPUT -o ${WAN_INTERFACE} -p udp --dport ${VPN_PORT} -d ${VPN_ENDPOINT} -j ACCEPT
 iptables -A OUTPUT -o ${WAN_INTERFACE} -m state --state ESTABLISHED,RELATED -j ACCEPT
+# Block all other WAN traffic from LAN (force through VPN)
 iptables -A FORWARD -i ${LAN_INTERFACE} -o ${WAN_INTERFACE} -j DROP
 iptables -A FORWARD -i ${WIFI_INTERFACE} -o ${WAN_INTERFACE} -j DROP
 
-# Log dropped packets
+# Log dropped packets (rate limited)
 iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "IPT-INPUT-DROP: "
 iptables -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "IPT-FORWARD-DROP: "
 
@@ -359,6 +485,26 @@ chmod +x /opt/router/config/iptables/firewall.sh
 /opt/router/config/iptables/firewall.sh
 netfilter-persistent save
 
+# Create systemd service for firewall
+cat > /etc/systemd/system/router-firewall.service << 'EOF'
+[Unit]
+Description=Router Firewall Rules
+After=network-pre.target
+Before=network.target wg-quick@wg0.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/config/iptables/firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable router-firewall.service
+
 echo -e "${GREEN}[Phase 9] Firewall configured${NC}"
 
 # ============================================
@@ -366,6 +512,7 @@ echo -e "${GREEN}[Phase 9] Firewall configured${NC}"
 # ============================================
 echo -e "${GREEN}[Phase 10] Setting up Docker containers...${NC}"
 
+# Hardcode tokens directly in docker-compose.yml (per Agent 1 findings)
 cat > /opt/router/docker/docker-compose.yml << EOF
 services:
   twingate:
@@ -377,8 +524,8 @@ services:
       - net.ipv4.ping_group_range=0 2147483647
     environment:
       - TWINGATE_NETWORK=${TWINGATE_NETWORK}
-      - TWINGATE_ACCESS_TOKEN=\${TWINGATE_ACCESS_TOKEN}
-      - TWINGATE_REFRESH_TOKEN=\${TWINGATE_REFRESH_TOKEN}
+      - TWINGATE_ACCESS_TOKEN=${TWINGATE_ACCESS_TOKEN}
+      - TWINGATE_REFRESH_TOKEN=${TWINGATE_REFRESH_TOKEN}
       - TWINGATE_LABEL_HOSTNAME=rock5b-router
       - TWINGATE_LABEL_DEPLOYED_BY=docker-compose
     networks:
@@ -419,13 +566,6 @@ volumes:
   portainer_data:
 EOF
 
-cat > /opt/router/docker/.env << EOF
-TWINGATE_ACCESS_TOKEN=${TWINGATE_ACCESS_TOKEN}
-TWINGATE_REFRESH_TOKEN=${TWINGATE_REFRESH_TOKEN}
-EOF
-
-chmod 600 /opt/router/docker/.env
-
 cd /opt/router/docker
 docker compose pull
 docker compose up -d
@@ -441,7 +581,7 @@ cat > /etc/systemd/system/router-stack.service << EOF
 [Unit]
 Description=Router Stack (Docker Compose)
 Requires=docker.service
-After=docker.service network-online.target
+After=docker.service network-online.target router-firewall.service wg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
@@ -481,17 +621,31 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 echo ""
 
 echo "Network Interfaces:"
-echo "  LAN (${LAN_INTERFACE}): $(ip addr show ${LAN_INTERFACE} 2>/dev/null | grep 'inet ' | awk '{print $2}')"
-echo "  WiFi (${WIFI_INTERFACE}): $(ip addr show ${WIFI_INTERFACE} 2>/dev/null | grep 'inet ' | awk '{print $2}')"
+echo "  WAN (${WAN_INTERFACE}): $(ip addr show ${WAN_INTERFACE} 2>/dev/null | grep 'inet ' | awk '{print $2}')"
+echo "  LAN Wired (${LAN_INTERFACE}): $(ip addr show ${LAN_INTERFACE} 2>/dev/null | grep 'inet ' | awk '{print $2}')"
+echo "  LAN WiFi (${WIFI_INTERFACE}): $(ip addr show ${WIFI_INTERFACE} 2>/dev/null | grep 'inet ' | awk '{print $2}')"
+echo ""
+
+echo -e "${YELLOW}Network Configuration:${NC}"
+echo "  WiFi Network: ${WIFI_SUBNET} (Gateway: ${WIFI_IP})"
+echo "  Wired Network: ${LAN_SUBNET} (Gateway: ${LAN_IP})"
 echo ""
 
 echo -e "${YELLOW}Important Next Steps:${NC}"
 echo "1. Change WiFi password in /etc/hostapd/hostapd.conf"
-echo "2. Reserve IP 192.168.0.10 for this device on Hitron"
-echo "3. Reboot to verify everything starts automatically"
-echo "4. Access Portainer at https://${LAN_IP}:9443"
+echo "2. Update Twingate tokens in /opt/router/docker/docker-compose.yml if needed"
+echo "3. Reserve IP on Hitron modem for ${WAN_INTERFACE}"
+echo "4. Reboot to verify everything starts automatically"
+echo "5. Access Portainer at https://${WIFI_IP}:9443 or https://${LAN_IP}:9443"
 echo ""
 echo -e "${YELLOW}To verify VPN:${NC}"
 echo "  curl https://ipinfo.io/ip"
+echo ""
+echo -e "${YELLOW}Changes from v1:${NC}"
+echo "  - WAN/LAN interfaces swapped for better stability"
+echo "  - Dual subnet design (WiFi: 10.3.141.x, Wired: 10.3.142.x)"
+echo "  - WireGuard watchdog service added"
+echo "  - systemd-resolved disabled to prevent conflicts"
+echo "  - USB autosuspend disabled for ethernet"
 echo ""
 echo -e "${GREEN}Reboot recommended: sudo reboot${NC}"
