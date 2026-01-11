@@ -196,6 +196,8 @@ echo -e "${GREEN}[Phase 4] Directories created${NC}"
 echo -e "${GREEN}[Phase 5] Configuring network interfaces...${NC}"
 
 # Configure network interfaces with separate subnets
+# NOTE: WiFi interface is NOT configured in netplan - hostapd manages it
+#       and we assign IP manually in Phase 7
 cat > /etc/netplan/01-router-config.yaml << EOF
 network:
   version: 2
@@ -212,14 +214,6 @@ network:
       addresses:
         - ${LAN_IP}/24
       dhcp4: false
-
-  # WiFi Access Point interface
-  wifis:
-    ${WIFI_INTERFACE}:
-      addresses:
-        - ${WIFI_IP}/24
-      dhcp4: false
-      access-points: {}
 EOF
 
 # Set secure permissions on netplan config
@@ -336,11 +330,22 @@ EOF
 
 echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' > /etc/default/hostapd
 
-# WiFi IP is now configured via netplan (no manual ip addr add needed)
+# Assign IP to WiFi interface manually (not via netplan - hostapd manages the interface)
+ip addr flush dev ${WIFI_INTERFACE} 2>/dev/null || true
+ip addr add ${WIFI_IP}/24 dev ${WIFI_INTERFACE}
+ip link set ${WIFI_INTERFACE} up
 
 systemctl unmask hostapd
 systemctl enable hostapd
 systemctl restart hostapd || echo -e "${YELLOW}Hostapd may need manual start${NC}"
+
+# Verify WiFi IP was assigned
+sleep 2
+if ip addr show ${WIFI_INTERFACE} | grep -q "${WIFI_IP}"; then
+    echo -e "${GREEN}WiFi interface ${WIFI_INTERFACE} has IP ${WIFI_IP}${NC}"
+else
+    echo -e "${YELLOW}Warning: WiFi IP may not be assigned correctly${NC}"
+fi
 
 echo -e "${GREEN}[Phase 7] WiFi AP configured${NC}"
 
@@ -504,6 +509,37 @@ EOF
 
 systemctl daemon-reload
 systemctl enable router-firewall.service
+
+# Create WiFi interface setup service (ensures IP is assigned at boot)
+cat > /opt/router/config/wifi-setup.sh << EOF
+#!/bin/bash
+# Assign IP to WiFi interface at boot
+sleep 5  # Wait for interface to be ready
+ip addr flush dev ${WIFI_INTERFACE} 2>/dev/null || true
+ip addr add ${WIFI_IP}/24 dev ${WIFI_INTERFACE} 2>/dev/null || true
+ip link set ${WIFI_INTERFACE} up
+echo "WiFi interface ${WIFI_INTERFACE} configured with IP ${WIFI_IP}"
+EOF
+
+chmod +x /opt/router/config/wifi-setup.sh
+
+cat > /etc/systemd/system/wifi-setup.service << 'EOF'
+[Unit]
+Description=WiFi Interface IP Setup
+After=network.target hostapd.service
+Before=dnsmasq.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/config/wifi-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable wifi-setup.service
 
 echo -e "${GREEN}[Phase 9] Firewall configured${NC}"
 
