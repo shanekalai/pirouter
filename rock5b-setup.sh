@@ -468,6 +468,23 @@ iptables -A FORWARD -i wg0 -o ${WIFI_INTERFACE} -j ACCEPT
 iptables -A FORWARD -i ${LAN_INTERFACE} -o ${WIFI_INTERFACE} -j ACCEPT
 iptables -A FORWARD -i ${WIFI_INTERFACE} -o ${LAN_INTERFACE} -j ACCEPT
 
+# Docker container traffic - allow containers to access VPN
+# Docker uses bridge networks (docker0, br-*)
+iptables -A FORWARD -i docker0 -o wg0 -j ACCEPT
+iptables -A FORWARD -i wg0 -o docker0 -j ACCEPT
+iptables -A FORWARD -i br-+ -o wg0 -j ACCEPT
+iptables -A FORWARD -i wg0 -o br-+ -j ACCEPT
+
+# Allow Docker containers to communicate with LAN
+iptables -A FORWARD -i docker0 -o ${LAN_INTERFACE} -j ACCEPT
+iptables -A FORWARD -i ${LAN_INTERFACE} -o docker0 -j ACCEPT
+iptables -A FORWARD -i br-+ -o ${LAN_INTERFACE} -j ACCEPT
+iptables -A FORWARD -i ${LAN_INTERFACE} -o br-+ -j ACCEPT
+
+# Allow INPUT from Docker networks
+iptables -A INPUT -i docker0 -j ACCEPT
+iptables -A INPUT -i br-+ -j ACCEPT
+
 # NAT for VPN tunnel
 iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
 
