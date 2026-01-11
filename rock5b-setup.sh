@@ -517,17 +517,17 @@ cat > /opt/router/docker/docker-compose.yml << EOF
 services:
   twingate:
     image: twingate/connector:1
-    container_name: twingate-connector
+    container_name: twingate-inquisitive-mackerel
     restart: unless-stopped
     pull_policy: always
     sysctls:
       - net.ipv4.ping_group_range=0 2147483647
     environment:
-      - TWINGATE_NETWORK=${TWINGATE_NETWORK}
-      - TWINGATE_ACCESS_TOKEN=${TWINGATE_ACCESS_TOKEN}
-      - TWINGATE_REFRESH_TOKEN=${TWINGATE_REFRESH_TOKEN}
-      - TWINGATE_LABEL_HOSTNAME=rock5b-router
-      - TWINGATE_LABEL_DEPLOYED_BY=docker-compose
+      - TWINGATE_NETWORK="cloudbranch"
+      - TWINGATE_ACCESS_TOKEN="eyJhbGciOiJFUzI1NiIsImtpZCI6ImF6cEZlX3FxQjdJdi0xUXBnUkxMWkw1akpldHhMdjFUckVSTzRvVDFYOUEiLCJ0eXAiOiJEQVQifQ.eyJhdWRzIjpudWxsLCJudCI6IkFOIiwiYWlkIjoiNzA0MDI3IiwiZGlkIjoiMjg2MTA3NSIsInJudyI6MTc2Nzk2Nzc4NywianRpIjoiYjgzNTFmNWQtYTk3MC00MTBlLWEzM2YtOTY2YjNhY2FlMTIzIiwiaXNzIjoidHdpbmdhdGUiLCJhdWQiOiJjbG91ZGJyYW5jaCIsImV4cCI6MTc2Nzk3MTA3NSwiaWF0IjoxNzY3OTY3NDc1LCJ2ZXIiOiI0IiwidGlkIjoiMTk5MTE0Iiwicm5ldGlkIjoiMjY1NTMyIn0.h6gtJHQp0Nx8E-x9_smmGE-qKRPRMWAtdKvMLICUTtRTtA1VHw7CPdHuemFKtvLbGmnitemcGPtH2zhtAJfr9Q"
+      - TWINGATE_REFRESH_TOKEN="YcE1UsCkpfyhHtdHxcYTUKSb5fQue_mxoBYICPzvNgOsFiUxPwCFrKdkQu0DHfODAID6GZFX1Ae58BjkyENuYxjTJjX43BzkD1P-Vg8awX6Fzc2LkbCYOEip3eVo_4dvhRCGAw"
+      - TWINGATE_LABEL_HOSTNAME="9dd15b63e246"
+      - TWINGATE_LABEL_DEPLOYED_BY="docker"
     networks:
       - router-net
 
